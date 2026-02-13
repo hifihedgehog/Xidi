@@ -1,12 +1,12 @@
 /***************************************************************************************************
  * Xidi
- *   DirectInput interface for XInput controllers.
+ * DirectInput interface for XInput controllers.
  ***************************************************************************************************
  * Authored by Samuel Grossman
  * Copyright (c) 2016-2025
  ***********************************************************************************************//**
  * @file PhysicalController.cpp
- *   Implementation of all functionality for communicating with physical controllers.
+ * Implementation of all functionality for communicating with physical controllers.
  **************************************************************************************************/
 
 #include "PhysicalController.h"
@@ -15,6 +15,7 @@
 #include <mutex>
 #include <set>
 #include <stop_token>
+#include <string>
 #include <thread>
 
 #include <Infra/Core/Message.h>
@@ -30,13 +31,11 @@
 #include "Strings.h"
 #include "VirtualController.h"
 
-#include <hidsdi.h>  // For HID APIs
-#include <hidpi.h>   // For HID parsing
-#include <hidclass.h>  // For GUID_DEVCLASS_HIDCLASS
+#include <hidsdi.h>
+#include <hidusage.h>
+#include <hidpi.h>
+#include <hidclass.h>
 #include <setupapi.h>
-
-#include <fstream>  // For std::ofstream
-#include <iomanip>  // For std::hex, std::setw, std::setfill
 
 const int XINPUT_GAMEPAD_GUIDE = 0x0400;
 const int XINPUT_GAMEPAD_SHARE = 0x0800;
@@ -53,8 +52,6 @@ namespace Xidi
     static ConcurrencyWrapper<SState> rawVirtualControllerState[kPhysicalControllerCount];
 
     /// Per-controller force feedback device buffer objects.
-    /// These objects are not safe for dynamic initialization, so they are initialized later by
-    /// pointer.
     static ForceFeedback::Device* physicalControllerForceFeedbackBuffer;
 
     /// Pointers to the virtual controller objects registered for force feedback with each physical
@@ -69,14 +66,22 @@ namespace Xidi
     /// Shared share button states for each controller, updated by HID threads.
     static ConcurrencyWrapper<bool> shareButtonState[kPhysicalControllerCount];
 
-    /// HID device handles and threads for each controller.
-    static HANDLE hHidDevice[kPhysicalControllerCount] = {INVALID_HANDLE_VALUE};
+    /// HID device handles for each controller.
+    /// All elements explicitly initialized to INVALID_HANDLE_VALUE.
+    static HANDLE hHidDevice[kPhysicalControllerCount] = {
+        INVALID_HANDLE_VALUE,
+        INVALID_HANDLE_VALUE,
+        INVALID_HANDLE_VALUE,
+        INVALID_HANDLE_VALUE};
+
     static std::thread hidReadThread[kPhysicalControllerCount];
 
+    /// Mutex and set for tracking which HID device paths have already been claimed
+    /// by a controller thread, so that each controller opens a DIFFERENT HID device.
+    static std::mutex hidDeviceClaimMutex;
+    static std::set<std::wstring> claimedHidDevicePaths;
+
     /// Computes an opaque source identifier from a given controller identifier.
-    /// @param [in] controllerIdentifier Identifier of the controller for which an
-    /// identifier is needed.
-    /// @return Opaque identifier that can be passed to mappers.
     static inline uint32_t OpaqueControllerSourceIdentifier(
         TControllerIdentifier controllerIdentifier)
     {
@@ -84,36 +89,71 @@ namespace Xidi
     }
 
     /// Background thread to poll HID for share button.
+    /// This thread is the sole owner of the HID handle for its controller index.
+    /// No other thread should close or modify hHidDevice[controllerIdentifier].
     /// @param [in] controllerIdentifier Identifier of the controller to poll.
     static void PollHidForShareButton(TControllerIdentifier controllerIdentifier)
     {
+      // Track the device path this controller claimed, so we can unclaim on disconnect
+      std::wstring myClaimedPath;
+
+      // Stagger initial startup by controller index to ensure deterministic
+      // enumeration order so HID devices are assigned to matching XInput indices.
+      Sleep(controllerIdentifier * 500);
+
       while (true)
       {
-        Sleep(1); // Poll at 1000Hz (1ms) for responsiveness
+        Sleep(1); // Poll at 1000Hz
+
         if (hHidDevice[controllerIdentifier] == INVALID_HANDLE_VALUE)
         {
-          // Dynamically find and open the HID device for this controller
+          // Only search for HID devices if our XInput controller is actually
+          // connected. This is critical: without this check, threads for
+          // controllers that have no physical hardware (e.g. controllers 2
+          // and 3 when only 2 gamepads are connected) would perpetually
+          // enumerate at 1ms intervals and steal HID devices that belong to
+          // other controllers during reconnection events.
+          XINPUT_STATE xinputCheck;
+          if (ImportApiXInput::XInputGetState(controllerIdentifier, &xinputCheck) != ERROR_SUCCESS)
+            continue;
+
           GUID hidGuid;
           HidD_GetHidGuid(&hidGuid);
+
           HDEVINFO hDevInfo = SetupDiGetClassDevs(
               &hidGuid, nullptr, nullptr, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+
           if (hDevInfo != INVALID_HANDLE_VALUE)
           {
             SP_DEVICE_INTERFACE_DATA interfaceData = {};
             interfaceData.cbSize = sizeof(SP_DEVICE_INTERFACE_DATA);
+
             for (DWORD index = 0;
-                 SetupDiEnumDeviceInterfaces(hDevInfo, nullptr, &hidGuid, index, &interfaceData);
+                 SetupDiEnumDeviceInterfaces(
+                     hDevInfo, nullptr, &hidGuid, index, &interfaceData);
                  ++index)
             {
               DWORD requiredSize = 0;
               SetupDiGetDeviceInterfaceDetail(
                   hDevInfo, &interfaceData, nullptr, 0, &requiredSize, nullptr);
+
               PSP_DEVICE_INTERFACE_DETAIL_DATA detailData =
                   (PSP_DEVICE_INTERFACE_DETAIL_DATA) new BYTE[requiredSize];
               detailData->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA);
+
               if (SetupDiGetDeviceInterfaceDetail(
                       hDevInfo, &interfaceData, detailData, requiredSize, nullptr, nullptr))
               {
+                // Check if this device path is already claimed by another controller
+                {
+                  std::lock_guard<std::mutex> lock(hidDeviceClaimMutex);
+                  if (claimedHidDevicePaths.count(detailData->DevicePath) > 0)
+                  {
+                    delete[] detailData;
+                    continue;
+                  }
+                }
+
                 HANDLE hDevice = CreateFile(
                     detailData->DevicePath,
                     GENERIC_READ,
@@ -121,29 +161,56 @@ namespace Xidi
                     nullptr,
                     OPEN_EXISTING,
                     0,
-                    nullptr); // FIXED: Removed FILE_FLAG_OVERLAPPED, back to synchronous for
-                              // reliable read
+                    nullptr);
+
                 if (hDevice != INVALID_HANDLE_VALUE)
                 {
                   HIDD_ATTRIBUTES attributes = {};
                   attributes.Size = sizeof(HIDD_ATTRIBUTES);
+
                   if (HidD_GetAttributes(hDevice, &attributes))
                   {
-                    if (attributes.VendorID == 0x045E) // Microsoft VID
+                    if (attributes.VendorID == 0x045E)
                     {
-                      // Check for Xbox PIDs (0x02FD for One, 0x0B13 for Series BT, 0x02FF for
-                      // Series USB)
                       if (attributes.ProductID == 0x02FD || attributes.ProductID == 0x0B13 ||
                           attributes.ProductID == 0x02FF)
                       {
-                        hHidDevice[controllerIdentifier] = hDevice; // Save handle
-                        Infra::Message::OutputFormatted(
-                            Infra::Message::ESeverity::Info,
-                            L"Opened HID device for controller %u with PID 0x%04X.",
-                            controllerIdentifier,
-                            attributes.ProductID);
-                        delete[] detailData;
-                        break; // Found and opened
+                        // Verify this is the correct HID collection by checking
+                        // input report byte length. Only the 16-byte report
+                        // collection contains the Share button data.
+                        bool correctCollection = false;
+                        PHIDP_PREPARSED_DATA preparsed = nullptr;
+                        if (HidD_GetPreparsedData(hDevice, &preparsed))
+                        {
+                          HIDP_CAPS caps = {};
+                          if (HidP_GetCaps(preparsed, &caps) == HIDP_STATUS_SUCCESS)
+                          {
+                            if (caps.InputReportByteLength == 16)
+                              correctCollection = true;
+                          }
+                          HidD_FreePreparsedData(preparsed);
+                        }
+
+                        if (correctCollection)
+                        {
+                          // Claim this device path
+                          {
+                            std::lock_guard<std::mutex> lock(hidDeviceClaimMutex);
+                            claimedHidDevicePaths.insert(detailData->DevicePath);
+                            myClaimedPath = detailData->DevicePath;
+                          }
+
+                          hHidDevice[controllerIdentifier] = hDevice;
+
+                          Infra::Message::OutputFormatted(
+                              Infra::Message::ESeverity::Info,
+                              L"Opened HID device for controller %u with PID 0x%04X.",
+                              controllerIdentifier,
+                              attributes.ProductID);
+
+                          delete[] detailData;
+                          break;
+                        }
                       }
                     }
                   }
@@ -152,13 +219,16 @@ namespace Xidi
               }
               delete[] detailData;
             }
+
             SetupDiDestroyDeviceInfoList(hDevInfo);
           }
         }
+
         if (hHidDevice[controllerIdentifier] != INVALID_HANDLE_VALUE)
         {
           BYTE reportBuffer[32] = {};
           DWORD bytesRead = 0;
+
           if (ReadFile(
                   hHidDevice[controllerIdentifier],
                   reportBuffer,
@@ -169,27 +239,52 @@ namespace Xidi
             bool sharePressed = (reportBuffer[0] == 0x00 && (reportBuffer[12] & 0x08));
             shareButtonState[controllerIdentifier].Update(sharePressed);
           }
+          else
+          {
+            // Any ReadFile failure means the device is gone or in a bad state.
+            // Close the handle and unclaim the path so re-enumeration can occur.
+            CloseHandle(hHidDevice[controllerIdentifier]);
+            hHidDevice[controllerIdentifier] = INVALID_HANDLE_VALUE;
+
+            // Clear share button state immediately on disconnect
+            shareButtonState[controllerIdentifier].Update(false);
+
+            // Unclaim the path so it can be re-claimed on reconnect
+            if (!myClaimedPath.empty())
+            {
+              std::lock_guard<std::mutex> lock(hidDeviceClaimMutex);
+              claimedHidDevicePaths.erase(myClaimedPath);
+              myClaimedPath.clear();
+            }
+
+            Infra::Message::OutputFormatted(
+                Infra::Message::ESeverity::Info,
+                L"HID device lost for controller %u, will re-enumerate on reconnect.",
+                controllerIdentifier);
+
+            // Stagger reconnection backoff by controller index so that
+            // lower-indexed controllers enumerate and claim first if
+            // multiple controllers reconnect simultaneously.
+            Sleep(200 + controllerIdentifier * 200);
+          }
         }
       }
     }
 
     /// Reads physical controller state.
-    /// @param [in] controllerIdentifier Identifier of the controller on which to operate.
-    /// @return Physical state of the identified controller.
+    /// Note: HID handle lifecycle is managed exclusively by PollHidForShareButton.
     static SPhysicalState ReadPhysicalControllerState(TControllerIdentifier controllerIdentifier)
     {
       XINPUT_STATE xinputState;
       DWORD xinputGetStateResult =
           ImportApiXInput::XInputGetState(controllerIdentifier, &xinputState);
+
       switch (xinputGetStateResult)
       {
         case ERROR_SUCCESS:
-          // Directly using wButtons assumes that the bit layout is the same between the internal
-          // bitset and the XInput data structure. The static assertions below this function verify
-          // this assumption and will cause a compiler error if it is wrong.
-          // Set share bit from shared state (updated by background thread)
           if (shareButtonState[controllerIdentifier].Get())
             xinputState.Gamepad.wButtons |= XINPUT_GAMEPAD_SHARE;
+
           return {
               .deviceStatus = EPhysicalDeviceStatus::Ok,
               .stick =
@@ -199,18 +294,10 @@ namespace Xidi
                    xinputState.Gamepad.sThumbRY},
               .trigger = {xinputState.Gamepad.bLeftTrigger, xinputState.Gamepad.bRightTrigger},
               .button = (uint16_t)(xinputState.Gamepad.wButtons)};
+
         case ERROR_DEVICE_NOT_CONNECTED:
-          // Close and reset HID handle on disconnection to re-open on reconnect
-          if (hHidDevice[controllerIdentifier] != INVALID_HANDLE_VALUE)
-          {
-            CloseHandle(hHidDevice[controllerIdentifier]);
-            hHidDevice[controllerIdentifier] = INVALID_HANDLE_VALUE;
-            Infra::Message::OutputFormatted(
-                Infra::Message::ESeverity::Info,
-                L"Closed HID device for controller %u on disconnection.",
-                controllerIdentifier);
-          }
           return {.deviceStatus = EPhysicalDeviceStatus::NotConnected};
+
         default:
           return {.deviceStatus = EPhysicalDeviceStatus::Error};
       }
@@ -233,13 +320,6 @@ namespace Xidi
     static_assert(1u << (unsigned int)EPhysicalButton::X == XINPUT_GAMEPAD_X);
     static_assert(1u << (unsigned int)EPhysicalButton::Y == XINPUT_GAMEPAD_Y);
 
-    /// Scales a vibration strength value by the specified scaling factor. If the resulting strength
-    /// exceeds the maximum possible strength it is saturated at the maximum possible strength.
-    /// @param [in] vibrationStrength Physical motor vibration strength value.
-    /// @param [in] scalingFactor Scaling factor by which to scale up or down the physical motor
-    /// vibration strength value.
-    /// @return Scaled physical motor vibration strength value that can then be sent directly to the
-    /// physical motor.
     static ForceFeedback::TPhysicalActuatorValue ScaledVibrationStrength(
         ForceFeedback::TPhysicalActuatorValue vibrationStrength, double scalingFactor)
     {
@@ -250,16 +330,12 @@ namespace Xidi
 
       constexpr double kMaxVibrationStrength =
           static_cast<double>(std::numeric_limits<ForceFeedback::TPhysicalActuatorValue>::max());
-      const double scaledVibrationStrength = static_cast<double>(vibrationStrength) * scalingFactor;
 
+      const double scaledVibrationStrength = static_cast<double>(vibrationStrength) * scalingFactor;
       return static_cast<ForceFeedback::TPhysicalActuatorValue>(
           std::min(scaledVibrationStrength, kMaxVibrationStrength));
     }
 
-    /// Writes a vibration command to a physical controller.
-    /// @param [in] controllerIdentifier Identifier of the controller on which to operate.
-    /// @param [in] vibration Physical actuator vibration vector.
-    /// @return `true` if successful, `false` otherwise.
     static bool WritePhysicalControllerVibration(
         TControllerIdentifier controllerIdentifier,
         ForceFeedback::SPhysicalActuatorComponents vibration)
@@ -272,19 +348,17 @@ namespace Xidi
                       .ValueOr(100)) /
           100.0;
 
-      // Impulse triggers are ignored because the XInput API does not support them.
       XINPUT_VIBRATION xinputVibration = {
           .wLeftMotorSpeed = ScaledVibrationStrength(
               vibration.leftMotor, kForceFeedbackEffectStrengthScalingFactor),
           .wRightMotorSpeed = ScaledVibrationStrength(
               vibration.rightMotor, kForceFeedbackEffectStrengthScalingFactor)};
+
       return (
           ERROR_SUCCESS ==
           ImportApiXInput::XInputSetState((DWORD)controllerIdentifier, &xinputVibration));
     }
 
-    /// Periodically plays force feedback effects on the physical controller actuators.
-    /// @param [in] controllerIdentifier Identifier of the controller on which to operate.
     static void ForceFeedbackActuateEffects(TControllerIdentifier controllerIdentifier)
     {
       constexpr ForceFeedback::TOrderedMagnitudeComponents kVirtualMagnitudeVectorZero = {};
@@ -313,11 +387,6 @@ namespace Xidi
           {
             std::unique_lock lock(physicalControllerForceFeedbackMutex[controllerIdentifier]);
 
-            // Gain is modified downwards by each virtual controller object.
-            // Typically there would only be one, in which case the properties of that object would
-            // be effective. Otherwise this loop is essentially modeled as multiple volume knobs
-            // connected in sequence, each lowering the volume of the effects by the value of its
-            // own device-wide gain property.
             for (auto virtualController :
                  physicalControllerForceFeedbackRegistration[controllerIdentifier])
               overallEffectGain *=
@@ -348,10 +417,6 @@ namespace Xidi
       }
     }
 
-    /// Periodically polls for physical controller state.
-    /// On detected state change, updates the internal data structure and notifies all waiting
-    /// threads.
-    /// @param [in] controllerIdentifier Identifier of the controller on which to operate.
     static void PollForPhysicalControllerStateChanges(TControllerIdentifier controllerIdentifier)
     {
       SPhysicalState newPhysicalState = physicalControllerState[controllerIdentifier].Get();
@@ -382,10 +447,6 @@ namespace Xidi
       }
     }
 
-    /// Monitors physical controller status for events like hardware connection or disconnection and
-    /// error conditions. Used exclusively for logging. Intended to be a thread entry point, one
-    /// thread per monitored physical controller.
-    /// @param [in] controllerIdentifier Identifier of the controller to monitor.
     static void MonitorPhysicalControllerStatus(TControllerIdentifier controllerIdentifier)
     {
       if (controllerIdentifier >= kPhysicalControllerCount)
@@ -405,7 +466,6 @@ namespace Xidi
         WaitForPhysicalControllerStateChange(
             controllerIdentifier, newPhysicalState, std::stop_token());
 
-        // Look for status changes and output to the log, as appropriate.
         switch (newPhysicalState.deviceStatus)
         {
           case EPhysicalDeviceStatus::Ok:
@@ -413,14 +473,12 @@ namespace Xidi
             {
               case EPhysicalDeviceStatus::Ok:
                 break;
-
               case EPhysicalDeviceStatus::NotConnected:
                 Infra::Message::OutputFormatted(
                     Infra::Message::ESeverity::Info,
                     L"Physical controller %u: Hardware connected.",
                     (1 + controllerIdentifier));
                 break;
-
               default:
                 Infra::Message::OutputFormatted(
                     Infra::Message::ESeverity::Warning,
@@ -451,13 +509,8 @@ namespace Xidi
       }
     }
 
-    /// Initializes internal data structures and creates worker threads.
-    /// Idempotent and concurrency-safe.
     static void Initialize(void)
     {
-      // There is overhead to using call_once, even after the operation is completed, and physical
-      // controller functions are called frequently. Using this additional flag avoids that overhead
-      // in the common case.
       static bool isInitialized = false;
       if (true == isInitialized) return;
 
@@ -466,7 +519,10 @@ namespace Xidi
           initFlag,
           []() -> void
           {
-            // Initialize controller state data structures.
+            // Ensure ALL hHidDevice entries are INVALID_HANDLE_VALUE
+            for (auto i = 0; i < kPhysicalControllerCount; ++i)
+              hHidDevice[i] = INVALID_HANDLE_VALUE;
+
             for (auto controllerIdentifier = 0;
                  controllerIdentifier < _countof(physicalControllerState);
                  ++controllerIdentifier)
@@ -483,13 +539,11 @@ namespace Xidi
               rawVirtualControllerState[controllerIdentifier].Set(initialRawVirtualState);
             }
 
-            // Ensure the system timer resolution is suitable for the desired polling frequency.
             TIMECAPS timeCaps;
             MMRESULT timeResult = ImportApiWinMM::timeGetDevCaps(&timeCaps, sizeof(timeCaps));
             if (MMSYSERR_NOERROR == timeResult)
             {
               timeResult = ImportApiWinMM::timeBeginPeriod(timeCaps.wPeriodMin);
-
               if (MMSYSERR_NOERROR == timeResult)
                 Infra::Message::OutputFormatted(
                     Infra::Message::ESeverity::Info,
@@ -509,7 +563,6 @@ namespace Xidi
                   timeResult);
             }
 
-            // Create and start the polling threads.
             for (auto controllerIdentifier = 0; controllerIdentifier < kPhysicalControllerCount;
                  ++controllerIdentifier)
             {
@@ -521,7 +574,6 @@ namespace Xidi
                   kPhysicalPollingPeriodMilliseconds);
             }
 
-            // Create and start the HID polling threads for the share button.
             for (auto controllerIdentifier = 0; controllerIdentifier < kPhysicalControllerCount;
                  ++controllerIdentifier)
             {
@@ -534,8 +586,6 @@ namespace Xidi
                   (unsigned int)(1 + controllerIdentifier));
             }
 
-            // Allocate the force feedback device buffers, then create and start the force feedback
-            // threads.
             physicalControllerForceFeedbackBuffer =
                 new ForceFeedback::Device[kPhysicalControllerCount];
             for (auto controllerIdentifier = 0; controllerIdentifier < kPhysicalControllerCount;
@@ -549,8 +599,6 @@ namespace Xidi
                   kPhysicalForceFeedbackPeriodMilliseconds);
             }
 
-            // Create and start the physical controller hardware status monitoring threads, but only
-            // if the messages generated by those threads will actually be delivered as output.
             if (Infra::Message::WillOutputMessageOfSeverity(Infra::Message::ESeverity::Warning))
             {
               for (auto controllerIdentifier = 0; controllerIdentifier < kPhysicalControllerCount;
@@ -602,7 +650,6 @@ namespace Xidi
 
       std::unique_lock lock(physicalControllerForceFeedbackMutex[controllerIdentifier]);
       physicalControllerForceFeedbackRegistration[controllerIdentifier].insert(virtualController);
-
       return &physicalControllerForceFeedbackBuffer[controllerIdentifier];
     }
 
@@ -630,9 +677,7 @@ namespace Xidi
         std::stop_token stopToken)
     {
       Initialize();
-
       if (controllerIdentifier >= kPhysicalControllerCount) return false;
-
       return physicalControllerState[controllerIdentifier].WaitForUpdate(state, stopToken);
     }
 
@@ -640,9 +685,7 @@ namespace Xidi
         TControllerIdentifier controllerIdentifier, SState& state, std::stop_token stopToken)
     {
       Initialize();
-
       if (controllerIdentifier >= kPhysicalControllerCount) return false;
-
       return rawVirtualControllerState[controllerIdentifier].WaitForUpdate(state, stopToken);
     }
   } // namespace Controller
