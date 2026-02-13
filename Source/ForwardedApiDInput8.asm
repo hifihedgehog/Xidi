@@ -3,7 +3,7 @@
 ;   DirectInput interface for XInput controllers.
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ; Authored by Samuel Grossman
-; Copyright (c) 2016-2025
+; Copyright (c) 2016-2026
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ; ForwardedApiDInput8.asm
 ;   Partial implementation of exported function entry points for DInput8 that should be forwarded

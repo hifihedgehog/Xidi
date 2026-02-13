@@ -3,7 +3,7 @@
  *   General-purpose library for injecting DLLs and hooking function calls.
  ***************************************************************************************************
  * Authored by Samuel Grossman
- * Copyright (c) 2019-2025
+ * Copyright (c) 2019-2026
  ***********************************************************************************************//**
  * @file HookshotInterface.h
  *   Declaration of the IHookshot family of interfaces and associated functions. External users 

@@ -3,7 +3,7 @@
  * DirectInput interface for XInput controllers.
  ***************************************************************************************************
  * Authored by Samuel Grossman
- * Copyright (c) 2016-2025
+ * Copyright (c) 2016-2026
  ***********************************************************************************************//**
  * @file PhysicalController.cpp
  * Implementation of all functionality for communicating with physical controllers.

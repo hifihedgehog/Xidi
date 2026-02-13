@@ -3,7 +3,7 @@
  *   General-purpose library for injecting DLLs and hooking function calls.
  ***************************************************************************************************
  * Authored by Samuel Grossman
- * Copyright (c) 2019-2025
+ * Copyright (c) 2019-2026
  ***********************************************************************************************//**
  * @file HookshotTypes.h
  *   Common types definitions and associated helper functions used in the public Hookshot

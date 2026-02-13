@@ -3,7 +3,7 @@
 ;   DirectInput interface for XInput controllers.
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ; Authored by Samuel Grossman
-; Copyright (c) 2016-2025
+; Copyright (c) 2016-2026
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ; DllExportForward.inc
 ;   Declaration of assembly macros for creating exported entry points in a DLL that are perfectly
